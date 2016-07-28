@@ -29,6 +29,7 @@ import locale
 import logging
 import getpass
 import errno
+from multiprocessing import Lock
 from struct import unpack, pack
 from termios import TIOCGWINSZ
 
@@ -37,13 +38,6 @@ from ansible.errors import AnsibleError
 from ansible.utils.color import stringc
 from ansible.utils.unicode import to_bytes, to_unicode
 
-try:
-    from __main__ import debug_lock
-except ImportError:
-    # for those not using a CLI, though ...
-    # this might not work well after fork
-    from multiprocessing import Lock
-    debug_lock = Lock()
 
 try:
     # Python 2
@@ -73,6 +67,8 @@ class Display:
 
         self.columns = None
         self.verbosity = verbosity
+
+        self._debug_lock = Lock()
 
         # list of all deprecation messages to prevent duplicate display
         self._deprecations = {}
@@ -184,9 +180,9 @@ class Display:
 
     def debug(self, msg):
         if C.DEFAULT_DEBUG:
-            debug_lock.acquire()
+            self._debug_lock.acquire()
             self.display("%6d %0.5f: %s" % (os.getpid(), time.time(), msg), color=C.COLOR_DEBUG)
-            debug_lock.release()
+            self._debug_lock.release()
 
     def verbose(self, msg, host=None, caplevel=2):
         # FIXME: this needs to be implemented
