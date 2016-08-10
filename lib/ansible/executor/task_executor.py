@@ -72,6 +72,8 @@ class TaskExecutor:
         self._connection        = None
         self._rslt_q            = rslt_q
 
+        self._templar = Templar(loader=self._loader, shared_loader_obj=self._shared_loader_obj, variables=self._job_vars)
+
     def run(self):
         '''
         The main executor entrypoint, where we determine if the specified
@@ -171,7 +173,6 @@ class TaskExecutor:
                 old_vars[k] = self._job_vars[k]
             self._job_vars[k] = play_context_vars[k]
 
-        templar = Templar(loader=self._loader, shared_loader_obj=self._shared_loader_obj, variables=self._job_vars)
         items = None
         if self._task.loop:
             if self._task.loop in self._shared_loader_obj.lookup_loader:
@@ -180,17 +181,17 @@ class TaskExecutor:
                     # first_found loops are special.  If the item is undefined
                     # then we want to fall through to the next value rather
                     # than failing.
-                    loop_terms = listify_lookup_plugin_terms(terms=self._task.loop_args, templar=templar, loader=self._loader, fail_on_undefined=False, convert_bare=True)
-                    loop_terms = [t for t in loop_terms if not templar._contains_vars(t)]
+                    loop_terms = listify_lookup_plugin_terms(terms=self._task.loop_args, templar=self._templar, loader=self._loader, fail_on_undefined=False, convert_bare=True)
+                    loop_terms = [t for t in loop_terms if not self._templar._contains_vars(t)]
                 else:
                     try:
-                        loop_terms = listify_lookup_plugin_terms(terms=self._task.loop_args, templar=templar, loader=self._loader, fail_on_undefined=True, convert_bare=True)
+                        loop_terms = listify_lookup_plugin_terms(terms=self._task.loop_args, templar=self._templar, loader=self._loader, fail_on_undefined=True, convert_bare=True)
                     except AnsibleUndefinedVariable as e:
                         display.deprecated("Skipping task due to undefined Error, in the future this will be a fatal error.: %s" % to_bytes(e))
                         return None
 
                 # get lookup
-                mylookup = self._shared_loader_obj.lookup_loader.get(self._task.loop, loader=self._loader, templar=templar)
+                mylookup = self._shared_loader_obj.lookup_loader.get(self._task.loop, loader=self._loader, templar=self._templar)
 
                 # give lookup task 'context' for subdir (mostly needed for first_found)
                 for subdir in ['template', 'var', 'file']: #TODO: move this to constants?
@@ -284,10 +285,10 @@ class TaskExecutor:
             # optimizing it here, the templatable string might use template vars
             # that aren't available until later (it could even use vars from the
             # with_items loop) so don't make the templated string permanent yet.
-            templar = Templar(loader=self._loader, shared_loader_obj=self._shared_loader_obj, variables=variables)
+            self._templar.set_available_variables(variables)
             task_action = self._task.action
-            if templar._contains_vars(task_action):
-                task_action = templar.template(task_action, fail_on_undefined=False)
+            if self._templar._contains_vars(task_action):
+                task_action = self._templar.template(task_action, fail_on_undefined=False)
 
             if len(items) > 0 and task_action in self.SQUASH_ACTIONS:
                 if all(isinstance(o, string_types) for o in items):
@@ -302,11 +303,11 @@ class TaskExecutor:
                     # contains a template that we can squash for
                     template_no_item = template_with_item = None
                     if name:
-                        if templar._contains_vars(name):
+                        if self._templar._contains_vars(name):
                             variables[loop_var] = '\0$'
-                            template_no_item = templar.template(name, variables, cache=False)
+                            template_no_item = self._templar.template(name, variables, cache=False)
                             variables[loop_var] = '\0@'
-                            template_with_item = templar.template(name, variables, cache=False)
+                            template_with_item = self._templar.template(name, variables, cache=False)
                             del variables[loop_var]
 
                         # Check if the user is doing some operation that doesn't take
@@ -315,8 +316,8 @@ class TaskExecutor:
                         if template_no_item != template_with_item:
                             for item in items:
                                 variables[loop_var] = item
-                                if self._task.evaluate_conditional(templar, variables):
-                                    new_item = templar.template(name, cache=False)
+                                if self._task.evaluate_conditional(self._templar, variables):
+                                    new_item = self._templar.template(name, cache=False)
                                     final_items.append(new_item)
                             self._task.args['name'] = final_items
                             # Wrap this in a list so that the calling function loop
@@ -350,18 +351,18 @@ class TaskExecutor:
         if variables is None:
             variables = self._job_vars
 
-        templar = Templar(loader=self._loader, shared_loader_obj=self._shared_loader_obj, variables=variables)
+        self._templar.set_available_variables(variables)
 
         context_validation_error = None
         try:
             # apply the given task's information to the connection info,
             # which may override some fields already set by the play or
             # the options specified on the command line
-            self._play_context = self._play_context.set_task_and_variable_override(task=self._task, variables=variables, templar=templar)
+            self._play_context = self._play_context.set_task_and_variable_override(task=self._task, variables=variables, templar=self._templar)
 
             # fields set from the play/task may be based on variables, so we have to
             # do the same kind of post validation step on it here before we use it.
-            self._play_context.post_validate(templar=templar)
+            self._play_context.post_validate(templar=self._templar)
 
             # now that the play context is finalized, if the remote_addr is not set
             # default to using the host's address field as the remote address
@@ -381,7 +382,7 @@ class TaskExecutor:
         # the fact that the conditional may specify that the task be skipped due to a
         # variable not being present which would otherwise cause validation to fail
         try:
-            if not self._task.evaluate_conditional(templar, variables):
+            if not self._task.evaluate_conditional(self._templar, variables):
                 display.debug("when evaluation failed, skipping this task")
                 return dict(changed=False, skipped=True, skip_reason='Conditional check failed', _ansible_no_log=self._play_context.no_log)
         except AnsibleError:
@@ -401,11 +402,11 @@ class TaskExecutor:
             if not include_file:
                 return dict(failed=True, msg="No include file was specified to the include")
 
-            include_file = templar.template(include_file)
+            include_file = self._templar.template(include_file)
             return dict(include=include_file, include_variables=include_variables)
 
         # Now we do final validation on the task, which sets all fields to their final values.
-        self._task.post_validate(templar=templar)
+        self._task.post_validate(templar=self._templar)
         if '_variable_params' in self._task.args:
             variable_params = self._task.args.pop('_variable_params')
             if isinstance(variable_params, dict):
@@ -415,14 +416,14 @@ class TaskExecutor:
 
         # get the connection and the handler for this execution
         if not self._connection or not getattr(self._connection, 'connected', False) or self._play_context.remote_addr != self._connection._play_context.remote_addr:
-            self._connection = self._get_connection(variables=variables, templar=templar)
+            self._connection = self._get_connection(variables=variables, templar=self._templar)
             self._connection.set_host_overrides(host=self._host, hostvars=variables.get('hostvars', {}).get(self._host.name, {}))
         else:
             # if connection is reused, its _play_context is no longer valid and needs
             # to be replaced with the one templated above, in case other data changed
             self._connection._play_context = self._play_context
 
-        self._handler = self._get_action_handler(connection=self._connection, templar=templar)
+        self._handler = self._get_action_handler(connection=self._connection, templar=self._templar)
 
         # And filter out any fields which were set to default(omit), and got the omit token value
         omit_token = variables.get('omit')
@@ -469,7 +470,7 @@ class TaskExecutor:
 
             if self._task.async > 0:
                 if self._task.poll > 0:
-                    result = self._poll_async_result(result=result, templar=templar, task_vars=vars_copy)
+                    result = self._poll_async_result(result=result, task_vars=vars_copy)
 
                 # ensure no log is preserved
                 result["_ansible_no_log"] = self._play_context.no_log
@@ -479,13 +480,13 @@ class TaskExecutor:
                 if self._task.changed_when is not None and self._task.changed_when:
                     cond = Conditional(loader=self._loader)
                     cond.when = self._task.changed_when
-                    result['changed'] = cond.evaluate_conditional(templar, vars_copy)
+                    result['changed'] = cond.evaluate_conditional(self._templar, vars_copy)
 
             def _evaluate_failed_when_result(result):
                 if self._task.failed_when:
                     cond = Conditional(loader=self._loader)
                     cond.when = self._task.failed_when
-                    failed_when_result = cond.evaluate_conditional(templar, vars_copy)
+                    failed_when_result = cond.evaluate_conditional(self._templar, vars_copy)
                     result['failed_when_result'] = result['failed'] = failed_when_result
                 else:
                     failed_when_result = False
@@ -508,7 +509,7 @@ class TaskExecutor:
             if retries > 1:
                 cond = Conditional(loader=self._loader)
                 cond.when = self._task.until
-                if cond.evaluate_conditional(templar, vars_copy):
+                if cond.evaluate_conditional(self._templar, vars_copy):
                     break
                 else:
                     # no conditional check, or it failed, so sleep for the specified time
@@ -553,7 +554,7 @@ class TaskExecutor:
         display.debug("attempt loop complete, returning result")
         return result
 
-    def _poll_async_result(self, result, templar, task_vars=None):
+    def _poll_async_result(self, result, templar=None, task_vars=None):
         '''
         Polls for the specified JID to be complete
         '''
@@ -580,7 +581,7 @@ class TaskExecutor:
             connection=self._connection,
             play_context=self._play_context,
             loader=self._loader,
-            templar=templar,
+            templar=self._templar,
             shared_loader_obj=self._shared_loader_obj,
         )
 
